@@ -1,0 +1,3 @@
+optimize away PassThough pipe when possible
+handle process crash
+how much PassThrough buffers before it blocks writer?
