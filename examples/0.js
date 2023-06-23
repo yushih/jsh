@@ -14,8 +14,8 @@ run('cmd')
   ))
 
 
-
-capture(
+----------------
+run(
   'cat ./file1',
   'grep \d',
   capture
@@ -46,4 +46,17 @@ run(
    []
  )
 
+)
+------
+run(
+  handleStderr('cmd', function (stderr, stdout) {
+    stderr.pipe(stdout);
+    return stdout;
+  }),
+  'filter',
+  dup(
+    [],
+    [],
+  ),
+  
 )

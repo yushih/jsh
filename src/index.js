@@ -1,149 +1,229 @@
 const child_process = require('child_process');
 const stream = require('stream');
+const readline = require('readline');
 
-function tee(path) {
-  return {
-    type: tee,
-    path
+/* 
+type runtime:
+{
+  stdout:
+  stderr:
+  exitPromise:
+}
+
+type runnable function:
+function (stdin, captureCallback) {
+  return runtime;
+}
+
+type runnable:
+{
+  run: runnable function
+}
+*/
+
+function cmdToRunnable(cmd) {
+  if (typeof cmd === 'string') {
+    function runCmdStr(stdin) {
+      /*
+      stdin.on('data', function (data) {
+        console.log('>>>%s input', cmd, data.toString());
+      });
+      */
+      const child = child_process.spawn(
+        cmd,
+        {
+          shell: true,
+          // not working:
+          //stdio: [stdin, 'pipe', 'pipe']
+        }
+      );
+      stdin.pipe(child.stdin);
+      return {
+        stdout: child.stdout,
+        stderr: child.stderr,
+        exitPromise: new Promise((resolve, reject) => {
+          child.on('exit', function (_code, _signal) {
+            stdin.destroy();
+            resolve();
+          });
+        }),
+      };
+    } // runCmdStr
+    return {
+      run: runCmdStr,
+    };
+  } else if (typeof cmd === 'function') {
+    return { run: cmd };
+  } else {
+    throw new Error('unrecognized cmd');
+  }
+}
+
+
+//  func: runtime => runtime
+function manipulateRuntime(cmd, func) {
+  const runnable = cmdToRunnable(cmd);
+  return function (stdin) {
+    const runtime = runnable.run(stdin);
+    return func(runtime);
   };
+}
+
+function handleStderr(cmd, func) {
+  return manipulateRuntime(cmd, function (runtime) {
+    func(stdErr);
+    return runtime;
+  });
+}
+
+function includeStderr(cmd) {
+  return manipulateRuntime(cmd, function (runtime) {
+    //not working: runtime.stderr.pipe(runtime.stdout);
+    const merged = new stream.PassThrough();
+    runtime.stderr.on('data', data => merged.write(data));
+    runtime.stdout.on('data', data => merged.write(data));
+    return {
+      ...runtime,
+      stdout: merged,
+      stderr: null,
+    };
+  });
 }
 
 function capture() {
-  return { type: capture };
-}
-
-function output() {
-  return {
-    type: output,
+  return function (stdin, captureCallback) {
+    stdin.on('data', captureCallback);
+    return {
+      stdout: null, //? or stdin
+      stderr: null,
+      exitPromise: new Promise(resolve => stdin.on('end', resolve)),
+    };
   };
 }
 
-function split(pipelines) {
-  return {
-    type: split,
-    pipelines,
-  };
-}
+// todo: handle input exhaust before all cmds run
+function seq(...cmds) {
+  const runnables = cmds.map(cmdToRunnable);
+  const stdout = new stream.PassThrough();
+  const stderr = new stream.PassThrough();
 
-function mergeStderr() {
-  return function (stdout, stderr) {
-    const merged = new stream.PassThrough();
-    // todo handle ending & close
-    stdout.on('data', data => merged.push(data));
-    stderr.on('data', data => merged.push(data));
-    return { stdout: merged, stderr: null };
-  };
-}
-
-function isStdErrOut(arg) {
-  return Array.isArray(arg.stderr) && Array.isArray(arg.stdout);
-}
-
-function checkArgs(args) {
-  let terminated = false;
-
-  for (const arg of args) {
-    const throwError = (err) => {
-      throw new Error(`${err}: ${JSON.stringify(arg)}`);
-    }
-
-    if (typeof arg === 'string') {
-      if (terminated) {
-        throwError('stream already terminated');
-      }
-    } else if (arg.type === split) {
-      terminated = true;
-      arg.pipelines.forEach(checkArgs);
-    } else if (arg.type === capture) {
-      terminated = true;
-    } else if (arg.type === output) {
-      terminated = true;
-    } else if (isStdErrOut(arg)) {
-      terminated = true;
-    } else if (typeof(arg) === 'function') {
-    } else {
-      throwError('unrecognized cmd');
-    }
-  }
-}
-
-function _run(
-  args,
-  upstreamStdout, upstreamStderr,
-  exitPromises,
-  captureCallback,
-) {
-  let stdout = upstreamStdout;
-  let stderr = upstreamStderr;
-
-  for (const arg of args) {
-    if (typeof arg === 'string') {
-      const child = child_process.spawn(
-        arg,
-        {
-          shell: true,
-          // todo: is this an optimization if `stdout` has a fd ?
-          // stdio: [stdout, 'pipe', 'pipe']
+  return function (stdin, captureCallback) {
+    return {
+      stdout,
+      stderr,
+      exitPromise: (async function () {
+        for (let i = 0; i < runnables.length; i++) {
+          const runtime = runnables[i].run(stdin, captureCallback);
+          const end = (i === runnables.length - 1);
+          runtime.stdout.pipe(stdout, { end });
+          if (runtime.stderr) {
+            runtime.stderr.pipe(stderr, { end });
+          }
+          await runtime.exitPromise;
         }
-      );
-      stdout.pipe(child.stdin);
-      stdout = child.stdout;
-      stderr = child.stderr;
-      exitPromises.push(new Promise(resolve => {
-        child.on('exit', function (_code, _signal) {
-          resolve();
-        });
-      }));
-    } else if (arg.type === split) {
-      for (const pipeline of arg.pipelines) {
-        const subStdout = new stream.PassThrough();
-        const subStderr = new stream.PassThrough();
-        _run(pipeline, subStdout, subStderr, exitPromises, captureCallback);
-        stdout.on('data', data => subStdout.write(data));
-        stderr.on('data', data => subStderr.write(data));
+      })(),
+    };
+  }
+}
+
+function transform(func) {
+  const stdout = new stream.PassThrough;
+  function writeLine(l) {
+    stdout.write(l);
+    stdout.write('\n');
+  };
+
+  return function (stdin) {
+    stdin.pause();
+    let ended = false;
+    stdin.once('end', () => { ended = true; });
+    const cachedLines = [];
+    let tail;
+    let resolveCallback;
+    stdin.on('data', function (buf) {
+      const str = buf.toString('utf8');
+      const lines = str.split('\n');
+      const last = lines.pop();
+      if (tail) {
+        tail = tail + last;
+      } else {
+        tail = last;
       }
-    } else if (arg.type === capture) {
-      stdout.on('data', captureCallback);
-    } else if (arg.type === output) {
-      stdout.pipe(process.stdout);
-    } else if (isStdErrOut(arg)) {
-      _run(arg.stderr, stderr, null, exitPromises, captureCallback);
-      _run(arg.stderr, stdout, null, exitPromises, captureCallback);
-    } else if (typeof arg === 'function') {
-      const ret = arg(stdout, stderr);
-      //todo: sanitize
-      stdout = ret.stdout;
-      stderr = ret.stderr;
+      cachedLines.push(...lines);
+      if (cachedLines.length) {
+        stdin.pause();
+        if (resolveCallback) {
+          const resolve = resolveCallback;
+          resolveCallback = undefined;
+          resolve(cachedLines.shift());
+        }
+      }
+    });
+
+    function readLine() {
+      if (cachedLines.length) {
+        return cachedLines.shift();
+      } else if (tail && ended) {
+        const ret = tail;
+        tail = undefined;
+        return tail;
+      } else if (ended) {
+        return undefined;
+      } else {
+        stdin.resume();
+        return new Promise(resolve => {
+          resolveCallback = resolve;
+        });
+      }
+    };
+    return {
+      stdout,
+      stderr: null,
+      exitPromise: func(readLine, writeLine).then(() => { stdout.close(); }),
+    };
+  };
+}
+
+// todo: ?make this return runnable function
+async function run(...cmds) {
+  const runnables = cmds.map(cmdToRunnable);
+
+  let pipe = process.stdin;
+  const exitPromises = [];
+  let captures;
+  function captureCallback(data) {
+    if (captures) {
+      captures.push(data);
     } else {
-      throwError('unrecognized cmd');
+      captures = [data];
     }
   }
 
-}
-
-async function run(...args) {
-  checkArgs(args);
-  const exitPromises = [];
-  let captured;
-  const capture = _run(
-    args,
-    process.stdin,
-    null,
-    exitPromises,
-    function captureCallback(data) {
-      if (!captured) {
-        captured = [data];
-      } else {
-        captured.push(data);
-      }
-    },
-  );
+  for (const runnable of runnables) {
+    const runtime = runnable.run(pipe, captureCallback);
+    pipe = runtime.stdout;
+    if (runtime.stderr) {
+      runtime.stderr.pipe(process.stdout);
+    }
+    exitPromises.push(runtime.exitPromise);
+  }
+  if (pipe) {
+    pipe.pipe(process.stdout);
+  }
   await Promise.all(exitPromises);
-  if (captured) {
-    return captured.map(buffer => buffer.toString('utf8')).join('');
+  if (captures) {
+    return captures.map(buffer => buffer.toString('utf8')).join('');
   } else {
     return undefined;
   }
 }
 
-module.exports = { run, output };
+module.exports = {
+  run,
+  handleStderr,
+  includeStderr,
+  capture,
+  seq,
+  transform,
+};
+
